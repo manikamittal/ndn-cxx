@@ -23,7 +23,9 @@
  */
 
 #include "validator.hpp"
+#include "../name-component.hpp"
 #include "../util/crypto.hpp"
+#include "../util/in-memory-storage-lru.hpp"
 
 #include "v1/cryptopp.hpp"
 
@@ -36,11 +38,13 @@ static Oid SECP384R1("1.3.132.0.34");
 Validator::Validator(Face* face)
   : m_face(face)
 {
+    m_certificates = make_shared<util::InMemoryStorageLru>(); 
 }
 
 Validator::Validator(Face& face)
   : m_face(&face)
-{
+{  
+    m_certificates = make_shared<util::InMemoryStorageLru>(); 
 }
 
 Validator::~Validator() = default;
@@ -82,7 +86,7 @@ Validator::validate(const Data& data,
   }
 
   OnFailure onFailure = bind(onValidationFailed, data.shared_from_this(), _1);
-  afterCheckPolicy(nextSteps, onFailure);
+  checkKeyBundle(data.getName(), nextSteps, onFailure); 
 }
 
 void
@@ -299,6 +303,156 @@ Validator::onTimeout(const Interest& interest,
   else {
     onFailure("Cannot fetch cert: " + interest.getName().toUri());
   }
+}
+
+void
+Validator::onBundleData(const Interest& origInterest,
+                        const Data& bundleData,  
+                        bool isSegmentZeroExpected, 
+                        const shared_ptr<ValidationRequest>& nextStep, 
+                        const std::vector<shared_ptr<ValidationRequest>>& nextSteps,
+                        const OnFailure& onFailure)
+{
+  name::Component currentSegment = bundleData.getName().get(-1);
+
+  if (isSegmentZeroExpected && currentSegment.toSegment() != 0) {
+    // fetch segment zero
+    fetchNextBundleSegment(origInterest, bundleData.getName(), nextStep, 
+                           0, nextSteps, onFailure);
+  }
+  else {
+    Block bundleContent = bundleData.getContent();     
+    bundleContent.parse(); 
+    Block::element_const_iterator bundleIterator = bundleContent.elements_begin(); 
+
+    // store certificates in memory 
+    while (bundleIterator != bundleContent.elements_end()) 
+    {
+      shared_ptr<Certificate> certificate = make_shared<Certificate>(*bundleIterator);
+      m_certificates->insert(*certificate); 
+      ++bundleIterator; 
+    }
+
+    // fetch next segment if applicable
+    const name::Component& finalBlockId = bundleData.getMetaInfo().getFinalBlockId();
+    if (finalBlockId.empty() || (finalBlockId > currentSegment)) {
+      fetchNextBundleSegment(origInterest, bundleData.getName(), nextStep, 
+                             currentSegment.toSegment() + 1, nextSteps, onFailure);
+    }
+    else {
+      util::InMemoryStorageLru::const_iterator certificateIterator = m_certificates->begin();
+      Certificate firstCert = Certificate(*certificateIterator);
+
+      onData(nextStep->m_interest, firstCert, nextStep);
+    }
+  }
+}
+
+void
+Validator::onBundleNack(const Interest& interest,
+                        const lp::Nack& nack, 
+                        const std::vector<shared_ptr<ValidationRequest>>& nextSteps,
+                        const OnFailure& onFailure)
+{
+  afterCheckPolicy(nextSteps, onFailure);
+}
+
+void
+Validator::onBundleTimeout(const Interest& interest, 
+                           const std::vector<shared_ptr<ValidationRequest>>& nextSteps,
+                           const OnFailure& onFailure)
+{
+  afterCheckPolicy(nextSteps, onFailure);
+}
+
+void
+Validator::checkKeyBundle(const Name& dataName,
+                          const std::vector<shared_ptr<ValidationRequest>>& nextSteps,
+                          const OnFailure& onFailure)
+{
+  shared_ptr<ValidationRequest> nextStep = nextSteps.front();
+  shared_ptr<const Data> certificate =  m_certificates->find(nextStep->m_interest); 
+
+  if (certificate == nullptr) {
+    Name bundleName = deriveBundleName(data.getName()); 
+    bundleName
+      .append("BUNDLE"); 
+
+    Interest bundleInterest = Interest(bundleName);
+    bundleInterest.setInterestLifetime(time::milliseconds(100000));
+    bundleInterest.setMustBeFresh(true);
+    bundleInterest.setChildSelector(1); 
+
+    fetchFirstBundleSegment(bundleInterest, nextStep, nextSteps, onFailure); 
+  }
+  else {
+    // if certificate is present in memory 
+    onData(nextStep->m_interest, *certificate, nextStep);  
+  }
+}
+
+Name 
+Validator::deriveBundleName(const Name& name) 
+{
+  name::Component lastComponent = name.get(- 1); 
+
+  Name bundleName = name; 
+  if(lastComponent.isImplicitSha256Digest()) {
+    if(name.get(-2).isSegment()) {
+      bundleName = name.getPrefix(-2); 
+    }
+    else {
+      bundleName = name.getPrefix(-1); 
+    }
+  }
+  else if(lastComponent.isSegment()) {
+    bundleName = name.getPrefix(-1); 
+  }
+  
+  return bundleName; 
+}
+
+void 
+Validator::fetchFirstBundleSegment(const Interest& interest, 
+                                   const shared_ptr<ValidationRequest>& nextStep, 
+                                   const std::vector<shared_ptr<ValidationRequest>>& nextSteps,
+                                   const OnFailure& onFailure)
+{
+  if (m_face == nullptr) {
+    onFailure("Require more information to validate the packet!");
+    return;
+  }
+
+  m_face->expressInterest(interest, 
+                          bind(&Validator::onBundleData, this,  _1, _2, 
+                               true, nextStep, nextSteps, onFailure), 
+                          bind(&Validator::onBundleNack, this, _1, _2, 
+                               nextSteps, onFailure), 
+                          bind(&Validator::onBundleTimeout, this, _1, 
+                               nextSteps, onFailure)); 
+}
+
+void 
+Validator::fetchNextBundleSegment(const Interest& origInterest, 
+                                  const Name& bundleDataName, 
+                                  const shared_ptr<ValidationRequest>& nextStep, 
+                                  uint64_t segmentNo, 
+                                  const std::vector<shared_ptr<ValidationRequest>>& nextSteps,
+                                  const OnFailure& onFailure)
+{
+  Interest interest(origInterest); // to preserve any selectors
+  interest.refreshNonce();
+  interest.setChildSelector(0);
+  interest.setMustBeFresh(false);
+  interest.setName(bundleDataName.getPrefix(-1).appendSegment(segmentNo));
+
+  m_face->expressInterest(interest,
+                         bind(&Validator::onBundleData, this,  _1, _2, 
+                              true, nextStep, nextSteps, onFailure), 
+                         bind(&Validator::onBundleNack, this, _1, _2, 
+                              nextSteps, onFailure), 
+                         bind(&Validator::onBundleTimeout, this, _1, 
+                              nextSteps, onFailure)); 
 }
 
 void

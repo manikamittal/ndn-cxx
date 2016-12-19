@@ -26,6 +26,7 @@
 #define NDN_SECURITY_VALIDATOR_HPP
 
 #include "../face.hpp"
+#include "../util/in-memory-storage.hpp"
 #include "signature-sha256-with-rsa.hpp"
 #include "signature-sha256-with-ecdsa.hpp"
 #include "digest-sha256.hpp"
@@ -259,6 +260,74 @@ protected:
            const OnInterestValidationFailed& onValidationFailed,
            int nSteps);
 
+  /**
+   * @brief Check if Key Bundle was fetched i.e. check if the next certificate 
+   *        for validation is present in memory. 
+   *
+   * If not derive the Key Bundle name, fetch key bundle and 
+   * store the certificates in memory. 
+   * 
+   * @param dataName  The Data Name used to derive Key Bundle name. 
+   * @param nextSteps Contains the set of validation steps. 
+   * @param onFailure Failure callback when errors happen while processing nextSteps.
+   */
+  void 
+  checkKeyBundle(const Name& dataName,
+                 const std::vector<shared_ptr<ValidationRequest>>& nextSteps,
+                 const OnFailure& onFailure); 
+
+  /**
+   * @brief Fetches the first segment of key bundle.
+   * 
+   * @param interest  Interest for initial segment of key bundle. 
+   * @param nextStep  Next validation step. 
+   * @param nextSteps Contains the set of validation steps. Used if NO key bundle. 
+   * @param onFailure Failure callback when errors happen while processing nextSteps.
+   */
+  void 
+  fetchFirstBundleSegment(const Interest& interest, 
+                          const shared_ptr<ValidationRequest>& nextStep, 
+                          const std::vector<shared_ptr<ValidationRequest>>& nextSteps,
+                          const OnFailure& onFailure); 
+
+  /**
+   * @brief Fetches the next segment of key bundle.
+   * 
+   * @param origInterest   Original Interest used for initial segment of key bundle. 
+   * @param bundleDataName Full bundle name as per the initial segment fetched.    
+   * @param nextStep       Next validation step. 
+   * @param segmentNo      Next segment number to be fetched.
+   * @param nextSteps      Contains the set of validation steps. Used if NO key bundle. 
+   * @param onFailure      Failure callback when errors happen while processing nextSteps.
+   */
+  void 
+  fetchNextBundleSegment(const Interest& origInterest, 
+                         const Name& bundleDataName, 
+                         const shared_ptr<ValidationRequest>& nextStep, 
+                         uint64_t segmentNo, 
+                         const std::vector<shared_ptr<ValidationRequest>>& nextSteps,
+                         const OnFailure& onFailure); 
+
+  /**
+   * @brief Processes the bundle data and stores the certificates in memory. 
+   *
+   * If required it will fetch the next segments of bundle.
+   * 
+   * @param origInterest          Original Interest used for initial segment of bundle.
+   * @param data                  Initial segment of bundle data retrieved.
+   * @param isSegmentZeroExpected Checks if the segment 0 is expected.
+   * @param nextStep              Next validation step.
+   * @param nextSteps             Contains the set of validation steps. Used if NO key bundle.
+   * @param onFailure             Failure callback when errors happen while processing nextSteps.
+   */
+  void 
+  onBundleData(const Interest& origInterest,
+               const Data& data,  
+               bool isSegmentZeroExpected, 
+               const shared_ptr<ValidationRequest>& nextStep, 
+               const std::vector<shared_ptr<ValidationRequest>>& nextSteps,
+               const OnFailure& onFailure); 
+
   /// Hooks
 
   /**
@@ -327,8 +396,53 @@ protected:
   afterCheckPolicy(const std::vector<shared_ptr<ValidationRequest>>& nextSteps,
                    const OnFailure& onFailure);
 
+  /** 
+   * @brief trigger when the bundle interest retrieves a Nack. 
+   * 
+   * If Key bundle interest retrieves a Nack, use afterCheckPolicy to retrieve 
+   * individual next validation step. 
+   * 
+   * @param interest  The interest that retrieves a nack. 
+   * @param nack      The Nack that is retrieved. 
+   * @param nextSteps Contains the set of validation steps. Used if NO key bundle.
+   * @param onFailure Failure callback when errors happen while processing nextSteps.
+   */ 
+  virtual void 
+  onBundleNack(const Interest& interest,
+               const lp::Nack& nack, 
+               const std::vector<shared_ptr<ValidationRequest>>& nextSteps,
+               const OnFailure& onFailure); 
+
+  /**
+   * @brief trigger when the bundle interest times out.
+   *
+   * If Key bundle interest times out, use afterCheckPolicy to retrieve 
+   * individual next validation step. 
+   *
+   * @param interest The interest that times out.
+   * @param nextSteps Contains the set of validation steps. Used if NO key bundle.
+   * @param onFailure Failure callback when errors happen while processing nextSteps.
+   */
+  virtual void
+  onBundleTimeout(const Interest& interest, 
+                  const std::vector<shared_ptr<ValidationRequest>>& nextSteps,
+                  const OnFailure& onFailure); 
+
+private: 
+  /**
+   * @brief Derives key bundle name from data name. 
+   *
+   * @param name The data name used to derive bundle name.
+   */
+  Name
+  deriveBundleName(const Name& name); 
+
 protected:
   Face* m_face;
+  /**
+   * @brief stores the certificates retrieved from key bundle
+   */
+  shared_ptr<util::InMemoryStorage> m_certificates; 
 };
 
 } // namespace security
